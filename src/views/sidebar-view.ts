@@ -1,4 +1,4 @@
-import { ItemView, WorkspaceLeaf, MarkdownView, TFile, Menu, Notice, setIcon, setTooltip, Keymap, Modal, App, moment } from 'obsidian';
+import { ItemView, WorkspaceLeaf, MarkdownView, TFile, Menu, Notice, setIcon, setTooltip, Keymap, Modal, App, Component, MarkdownRenderer, moment } from 'obsidian';
 import type HighlightCommentsPlugin from '../../main';
 import type { Highlight, Collection, CommentPluginSettings, Task } from '../../main';
 import { NewCollectionModal, EditCollectionModal } from '../modals/collection-modals';
@@ -12,6 +12,7 @@ import { SimpleSearchManager } from '../managers/simple-search-manager';
 import { STANDARD_FOOTNOTE_REGEX, FOOTNOTE_VALIDATION_REGEX } from '../utils/regex-patterns';
 import { HtmlHighlightParser } from '../utils/html-highlight-parser';
 import { DateSuggest } from '../utils/date-suggest';
+import type { AgentStatusUpdate, AgentWorkflowResult } from '../services/AIService';
 import { t } from '../i18n';
 
 const VIEW_TYPE_HIGHLIGHTS = 'highlights-sidebar';
@@ -4407,24 +4408,20 @@ export class HighlightsSidebarView extends ItemView {
                 // First focus the highlight in editor and wait for file switch to complete
                 await this.focusHighlightInEditor(highlight);
                 // Then add the footnote with targeted update
-                this.addFootnoteToHighlightWithTargetedUpdate(highlight);
+                await this.addFootnoteToHighlightWithTargetedUpdate(highlight);
             },
             onCommentClick: (highlight, commentIndex, event) => {
-                // Find the original index in highlight.footnoteContents
-                let originalIndex = -1;
-                let validIndexCounter = 0;
-                for(let i = 0; i < (highlight.footnoteContents?.length || 0); i++) {
-                    if (highlight.footnoteContents![i].trim() !== '') {
-                        if (validIndexCounter === commentIndex) {
-                            originalIndex = i;
-                            break;
-                        }
-                        validIndexCounter++;
-                    }
-                }
+                this.plugin.selectedCommentFootnoteName = null;
+                const originalIndex = this.getOriginalCommentIndex(highlight, commentIndex);
                 if (originalIndex !== -1) {
                     this.focusFootnoteInEditor(highlight, originalIndex, event);
                 }
+            },
+            onCommentDelete: async (highlight, commentIndex, event) => {
+                if (event) {
+                    event.stopPropagation();
+                }
+                await this.deleteSingleCommentFromSidebar(highlight, commentIndex);
             },
             onTagClick: (tag) => {
                 if (this.selectedTags.has(tag)) {
@@ -4447,6 +4444,157 @@ export class HighlightsSidebarView extends ItemView {
         };
 
         return this.highlightRenderer.createHighlightItem(container, highlight, options);
+    }
+
+    private getOriginalCommentIndex(highlight: Highlight, displayIndex: number): number {
+        let originalIndex = -1;
+        let validIndexCounter = 0;
+        for (let i = 0; i < (highlight.footnoteContents?.length || 0); i++) {
+            if (highlight.footnoteContents![i].trim() !== '') {
+                if (validIndexCounter === displayIndex) {
+                    originalIndex = i;
+                    break;
+                }
+                validIndexCounter++;
+            }
+        }
+        return originalIndex;
+    }
+
+    private async deleteSingleCommentFromSidebar(highlight: Highlight, displayIndex: number): Promise<void> {
+        const activeView = this.plugin.app.workspace.getActiveViewOfType(MarkdownView);
+        let content = activeView?.editor.getValue();
+        if (!content) {
+            const file = this.plugin.app.vault.getAbstractFileByPath(highlight.filePath);
+            if (!(file instanceof TFile)) {
+                new Notice('Highlight file not found.');
+                return;
+            }
+            content = await this.plugin.app.vault.cachedRead(file);
+        }
+
+        const footnoteName = this.resolveStandardFootnoteNameByDisplayIndex(highlight, displayIndex, content);
+
+        if (!footnoteName) {
+            new Notice('Only standard footnote comments can be deleted with this button.');
+            return;
+        }
+
+        const ok = await this.plugin.removeHighlightFromSource(highlight, 'remove-comments', footnoteName);
+        if (ok) {
+            new Notice(t('notices.commentsRemoved'));
+        } else {
+            new Notice('Could not remove the selected comment.');
+        }
+    }
+
+    private resolveStandardFootnoteNameByDisplayIndex(
+        highlight: Highlight,
+        displayIndex: number,
+        content: string
+    ): string | null {
+        const footnoteMap = this.plugin.extractFootnotes(content);
+        const footnoteItems: Array<{ type: 'standard' | 'inline'; name?: string; value: string }> = [];
+
+        const start = Math.max(0, Math.min(highlight.endOffset, content.length));
+        let pos = start;
+
+        while (pos < content.length) {
+            const wsMatch = content.substring(pos).match(/^\s*/);
+            const wsLen = wsMatch ? wsMatch[0].length : 0;
+            const afterWs = pos + wsLen;
+
+            const standardMatch = content.substring(afterWs).match(/^\[\^([a-zA-Z0-9_-]+)\](?!:)/);
+            if (standardMatch) {
+                const name = standardMatch[1];
+                footnoteItems.push({
+                    type: 'standard',
+                    name,
+                    value: (footnoteMap.get(name) || '').trim()
+                });
+                pos = afterWs + standardMatch[0].length;
+                continue;
+            }
+
+            if (content.substring(afterWs, afterWs + 2) === '^[') {
+                let i = afterWs + 2;
+                let depth = 1;
+                while (i < content.length && depth > 0) {
+                    if (content[i] === '[') depth++;
+                    else if (content[i] === ']') depth--;
+                    if (depth > 0) i++;
+                }
+
+                if (depth === 0) {
+                    const inlineValue = content.substring(afterWs + 2, i).trim();
+                    footnoteItems.push({ type: 'inline', value: inlineValue });
+                    pos = i + 1;
+                    continue;
+                }
+                break;
+            }
+
+            break;
+        }
+
+        const visible = footnoteItems.filter(item => item.value.trim() !== '');
+        if (displayIndex < 0 || displayIndex >= visible.length) {
+            return null;
+        }
+
+        const target = visible[displayIndex];
+        return target.type === 'standard' ? (target.name || null) : null;
+    }
+
+    private async promptForCommentInput(defaultPrompt: string, highlight: Highlight): Promise<string | null> {
+        return new Promise((resolve) => {
+            const modal = new CommentInputModal(
+                this.app,
+                defaultPrompt,
+                async (query, lengthMode, onStatus) => this.generateAIResponseForModal(highlight, query, lengthMode, onStatus),
+                (value) => resolve(value),
+                () => resolve(null)
+            );
+            modal.open();
+        });
+    }
+
+    private async generateAIResponseForModal(
+        highlight: Highlight,
+        query: string,
+        lengthMode: 'short' | 'medium',
+        onStatus?: (status: AgentStatusUpdate) => void
+    ): Promise<AgentWorkflowResult> {
+        const result = await this.plugin.getAIService().runAgenticWorkflow({
+            selectedText: highlight.text,
+            query,
+            lengthMode,
+            vault: this.plugin.app.vault,
+            onStatus
+        });
+
+        return {
+            ...result,
+            finalAnswer: this.extractModeSpecificResponse(result.finalAnswer, lengthMode)
+        };
+    }
+
+    private extractModeSpecificResponse(raw: string, lengthMode: 'short' | 'medium'): string {
+        const lines = raw.replace(/\r\n/g, '\n').split('\n').map(line => line.trim()).filter(Boolean);
+        const prefixes = lengthMode === 'short'
+            ? [/^short\s*[:：]\s*/i]
+            : [/^medium\s*[:：]\s*/i];
+
+        for (const line of lines) {
+            for (const prefix of prefixes) {
+                if (prefix.test(line)) {
+                    return line.replace(prefix, '').trim();
+                }
+            }
+        }
+
+        // Fallback: when model already obeys and returns a single paragraph.
+        return raw.replace(/\s+/g, ' ').trim();
     }
 
     /**
@@ -4478,9 +4626,16 @@ export class HighlightsSidebarView extends ItemView {
                 .setIcon('message-square-off')
                 .setDisabled(!hasComments)
                 .onClick(async () => {
-                    const ok = await this.plugin.removeHighlightFromSource(highlight, 'remove-comments');
+                    const targetFootnoteName = this.plugin.selectedCommentFootnoteName || undefined;
+                    if (!targetFootnoteName) {
+                        new Notice('Please click a specific standard footnote comment first.');
+                        return;
+                    }
+                    const ok = await this.plugin.removeHighlightFromSource(highlight, 'remove-comments', targetFootnoteName);
                     if (ok) {
                         new Notice(t('notices.commentsRemoved'));
+                    } else {
+                        new Notice('Could not remove the selected comment.');
                     }
                 });
         });
@@ -4509,17 +4664,117 @@ export class HighlightsSidebarView extends ItemView {
         }
     }
 
+    private async handleAIExplain(highlight: Highlight): Promise<void> {
+        const selectedText = highlight.text;
 
-    private async addFootnoteToHighlightWithTargetedUpdate(highlight: Highlight) {
+        if (!selectedText || selectedText.trim().length === 0) {
+            new Notice('No selected text found for this highlight.');
+            return;
+        }
+
+        new Notice('AI Explainer is generating...');
+
+        const explanation = await this.plugin
+            .getAIService()
+            .getExplanation(selectedText, this.plugin.app.vault);
+
+        if (!explanation || explanation.trim().length === 0) {
+            new Notice('AI Explainer returned empty content.');
+            return;
+        }
+
+        // Focus file first, then insert generated explanation as a standard footnote.
+        await this.focusHighlightInEditor(highlight);
+        await this.insertAIStandardFootnote(highlight, explanation);
+    }
+
+    private generateUniqueAIFootnoteId(content: string): string {
+        const footnoteIdRegex = /\[\^(\d+)\]/g;
+        let maxNumber = 0;
+        let match: RegExpExecArray | null;
+
+        while ((match = footnoteIdRegex.exec(content)) !== null) {
+            const value = Number.parseInt(match[1], 10);
+            if (!Number.isNaN(value) && value > maxNumber) {
+                maxNumber = value;
+            }
+        }
+
+        return `${maxNumber === 0 ? 1 : maxNumber + 1}`;
+    }
+
+    private formatExplanationForFootnote(explanation: string): string {
+        return explanation
+            .replace(/\r?\n+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    private appendStandardFootnoteDefinition(content: string, footnoteId: string, explanation: string): string {
+        const normalized = content.replace(/\r\n/g, '\n');
+        const definitionLine = `[^${footnoteId}]: ${explanation}`;
+
+        if (!normalized.trim()) {
+            return `${definitionLine}\n`;
+        }
+
+        const lines = normalized.split('\n');
+        let lastNonEmptyIndex = lines.length - 1;
+        while (lastNonEmptyIndex >= 0 && lines[lastNonEmptyIndex].trim() === '') {
+            lastNonEmptyIndex -= 1;
+        }
+
+        const isFootnoteDef = (line: string) => /^\[\^[^\]]+\]:\s*/.test(line);
+        const isFootnoteContinuation = (line: string) => /^( {2,}|\t+)\S/.test(line);
+        const hasTrailingFootnoteSection =
+            lastNonEmptyIndex >= 0 &&
+            (isFootnoteDef(lines[lastNonEmptyIndex]) || isFootnoteContinuation(lines[lastNonEmptyIndex]));
+
+        const trimmedEnd = normalized.replace(/\s*$/, '');
+        const separator = hasTrailingFootnoteSection ? '\n' : '\n\n';
+
+        return `${trimmedEnd}${separator}${definitionLine}\n`;
+    }
+
+    private async insertAIStandardFootnote(highlight: Highlight, explanation: string): Promise<void> {
         const activeView = this.plugin.app.workspace.getActiveViewOfType(MarkdownView);
-        if (!activeView) return;
+        if (!activeView || !activeView.file) {
+            new Notice('No active markdown file to insert AI explanation.');
+            return;
+        }
 
         const editor = activeView.editor;
         const file = activeView.file;
-        if (!file) return;
-
-        // Find the highlight in the editor content
         const content = editor.getValue();
+        const insertPos = this.resolveFootnoteInsertPosition(highlight, editor, content);
+
+        if (!insertPos) {
+            new Notice('Could not find the highlight in the editor. It might have been modified.');
+            return;
+        }
+
+        const footnoteId = this.generateUniqueAIFootnoteId(content);
+        const footnoteRef = `[^${footnoteId}]`;
+
+        // Step 1: append [^ID] right after the highlight/footnote chain.
+        editor.replaceRange(footnoteRef, insertPos);
+
+        // Step 2: append [^ID]: ... at end, merged with existing trailing footnote section if present.
+        const withReference = editor.getValue();
+        const formattedExplanation = this.formatExplanationForFootnote(explanation);
+        const withDefinition = this.appendStandardFootnoteDefinition(withReference, footnoteId, formattedExplanation);
+        editor.setValue(withDefinition);
+
+        await this.updateSingleHighlightFromEditor(highlight, file);
+        this.rerenderCurrentView();
+        new Notice(`AI explanation inserted as standard footnote [^${footnoteId}].`);
+    }
+
+    private resolveFootnoteInsertPosition(
+        highlight: Highlight,
+        editor: MarkdownView['editor'],
+        content: string
+    ): { line: number; ch: number } | null {
         let insertPos: { line: number; ch: number } | null = null;
 
         // For multi-paragraph highlights, we need to search the full content, not line-by-line
@@ -4720,15 +4975,37 @@ export class HighlightsSidebarView extends ItemView {
             }
         }
 
+        return insertPos;
+    }
+
+    private async addFootnoteToHighlightWithTargetedUpdate(highlight: Highlight) {
+        const activeView = this.plugin.app.workspace.getActiveViewOfType(MarkdownView);
+        if (!activeView) return;
+
+        const editor = activeView.editor;
+        const file = activeView.file;
+        if (!file) return;
+
+        // Find the highlight in the editor content
+        const content = editor.getValue();
+        const insertPos = this.resolveFootnoteInsertPosition(highlight, editor, content);
+
         if (!insertPos) {
             new Notice('Could not find the highlight in the editor. It might have been modified.');
             return;
         }
 
+        const defaultCommentPrompt = 'Add a short note here.';
+        const inputValue = await this.promptForCommentInput(defaultCommentPrompt, highlight);
+        if (inputValue === null) {
+            return;
+        }
+        const finalComment = inputValue.trim().length > 0 ? inputValue : defaultCommentPrompt;
+
         // Add the footnote
         if (this.plugin.settings.useInlineFootnotes) {
             // Use inline footnote
-            const result = this.plugin.inlineFootnoteManager.insertInlineFootnote(editor, highlight, '');
+            const result = this.plugin.inlineFootnoteManager.insertInlineFootnote(editor, highlight, finalComment);
             if (result.success && result.insertPos) {
                 // Position cursor inside the brackets after a delay for editor to process
                 setTimeout(() => {
@@ -4759,13 +5036,29 @@ export class HighlightsSidebarView extends ItemView {
                 new Notice('Could not insert inline footnote.');
             }
         } else {
-            // Use standard footnote
-            // Position cursor at the end of the highlight for the footnote command
-            editor.setCursor(insertPos);
-            editor.focus();
+            // Use standard footnote with a non-empty default prompt.
+            const footnoteId = this.generateUniqueAIFootnoteId(content);
+            editor.replaceRange(`[^${footnoteId}]`, insertPos);
 
-            (this.plugin.app as any).commands.executeCommandById('editor:insert-footnote');
-            // Wait for the footnote command to complete
+            const withReference = editor.getValue();
+            const withDefinition = this.appendStandardFootnoteDefinition(
+                withReference,
+                footnoteId,
+                finalComment
+            );
+            editor.setValue(withDefinition);
+
+            const definitionRegex = new RegExp(`^\\[\\^${this.escapeRegex(footnoteId)}\\]:\\s*(.*)$`, 'm');
+            const definitionMatch = withDefinition.match(definitionRegex);
+            if (definitionMatch) {
+                const lineText = definitionMatch[0];
+                const defStart = withDefinition.indexOf(lineText);
+                const contentStart = defStart + lineText.indexOf(definitionMatch[1]);
+                const contentEnd = contentStart + definitionMatch[1].length;
+                editor.setSelection(editor.offsetToPos(contentStart), editor.offsetToPos(contentEnd));
+                editor.focus();
+            }
+
             setTimeout(async () => {
                 await this.updateSingleHighlightFromEditor(highlight, file);
             }, 100);
@@ -5488,6 +5781,7 @@ export class HighlightsSidebarView extends ItemView {
             const targetFootnote = allFootnotes[footnoteIndex];
             
             if (targetFootnote.type === 'inline') {
+                this.plugin.selectedCommentFootnoteName = null;
                 // For inline footnotes and adjacent comments, focus on the content directly
                 const footnoteText = content.substring(targetFootnote.startIndex, targetFootnote.endIndex);
 
@@ -5610,6 +5904,7 @@ export class HighlightsSidebarView extends ItemView {
             } else {
                 // For standard footnotes, find the footnote definition
                 const footnoteKey = targetFootnote.content;
+                this.plugin.selectedCommentFootnoteName = footnoteKey;
                 const footnoteDefRegex = new RegExp(`^\\[\\^${this.escapeRegex(footnoteKey)}\\]:\\s*(.+)$`, 'm');
                 const footnoteDefMatch = content.match(footnoteDefRegex);
 
@@ -7473,6 +7768,421 @@ export class HighlightsSidebarView extends ItemView {
             return collectionNames.includes(filterNode.value);
         }
         return false;
+    }
+}
+
+class CommentInputModal extends Modal {
+    private placeholderText: string;
+    private onGenerate: (
+        query: string,
+        lengthMode: 'short' | 'medium',
+        onStatus?: (status: AgentStatusUpdate) => void
+    ) => Promise<AgentWorkflowResult>;
+    private onSubmit: (value: string) => void;
+    private onCancel: () => void;
+
+    private currentMode: 'COMMENT' | 'ASK_AI' = 'COMMENT';
+    private currentLengthMode: 'short' | 'medium' = 'short';
+    private isGenerating: boolean = false;
+
+    private commentTabEl!: HTMLElement;
+    private askAiTabEl!: HTMLElement;
+    private commentSectionEl!: HTMLElement;
+    private askAiSectionEl!: HTMLElement;
+    private commentInputEl!: HTMLTextAreaElement;
+    private askQueryInputEl!: HTMLTextAreaElement;
+    private askResponseRenderEl!: HTMLElement;
+    private agentStatusContainerEl!: HTMLElement;
+    private agentStatusLineEl!: HTMLElement;
+    private agentStatusIconEl!: HTMLElement;
+    private agentStatusTextEl!: HTMLElement;
+    private agentStatusTailEl!: HTMLElement;
+    private agentStatusHistoryEl!: HTMLElement;
+    private dfsContainerEl!: HTMLElement;
+    private addBtnEl!: HTMLButtonElement;
+    private generateBtnEl!: HTMLButtonElement;
+    private shortBtnEl!: HTMLDivElement;
+    private mediumBtnEl!: HTMLDivElement;
+    private onAskAIFn: (() => Promise<void>) | null = null;
+    private statusLogs: AgentStatusUpdate[] = [];
+    private statusHistoryExpanded: boolean = false;
+    private finalAnswerMarkdown = '';
+    private markdownRenderComponent = new Component();
+
+    constructor(
+        app: App,
+        placeholderText: string,
+        onGenerate: (
+            query: string,
+            lengthMode: 'short' | 'medium',
+            onStatus?: (status: AgentStatusUpdate) => void
+        ) => Promise<AgentWorkflowResult>,
+        onSubmit: (value: string) => void,
+        onCancel: () => void
+    ) {
+        super(app);
+        this.placeholderText = placeholderText;
+        this.onGenerate = onGenerate;
+        this.onSubmit = onSubmit;
+        this.onCancel = onCancel;
+    }
+
+    onOpen() {
+        this.markdownRenderComponent.load();
+        const { contentEl } = this;
+        contentEl.empty();
+
+        const modeNav = contentEl.createDiv({ cls: 'comment-modal-mode-nav' });
+        this.commentTabEl = modeNav.createDiv({ cls: 'comment-modal-mode-tab', text: 'Add comment' });
+        this.askAiTabEl = modeNav.createDiv({ cls: 'comment-modal-mode-tab', text: 'Ask AI' });
+
+        this.commentSectionEl = contentEl.createDiv({ cls: 'comment-modal-section' });
+        this.commentInputEl = this.commentSectionEl.createEl('textarea', {
+            cls: 'comment-modal-textarea',
+            attr: {
+                placeholder: this.placeholderText,
+                rows: '5'
+            }
+        });
+
+        this.askAiSectionEl = contentEl.createDiv({ cls: 'comment-modal-section sh-hidden' });
+        this.askQueryInputEl = this.askAiSectionEl.createEl('textarea', {
+            cls: 'comment-modal-textarea',
+            attr: {
+                placeholder: 'Ask something about this highlight...',
+                rows: '3'
+            }
+        });
+
+        const controls = this.askAiSectionEl.createDiv({ cls: 'comment-modal-ai-controls' });
+        this.generateBtnEl = controls.createEl('button', { text: 'Generate', cls: 'mod-cta comment-modal-generate-btn comment-modal-btn' });
+        const lengthStack = controls.createDiv({ cls: 'comment-modal-length-stack' });
+        this.shortBtnEl = lengthStack.createDiv({ text: 'Short', cls: 'length-option is-active' });
+        this.mediumBtnEl = lengthStack.createDiv({ text: 'Medium', cls: 'length-option' });
+
+        this.agentStatusContainerEl = this.askAiSectionEl.createDiv({ cls: 'comment-modal-agent-status sh-hidden' });
+        this.agentStatusLineEl = this.agentStatusContainerEl.createDiv({ cls: 'agent-status-line' });
+        this.agentStatusIconEl = this.agentStatusLineEl.createDiv({ cls: 'agent-status-icon' });
+        this.agentStatusTextEl = this.agentStatusLineEl.createDiv({ cls: 'agent-status-text' });
+        this.agentStatusTailEl = this.agentStatusLineEl.createDiv({ cls: 'agent-status-tail' });
+        this.agentStatusHistoryEl = this.agentStatusContainerEl.createDiv({ cls: 'agent-status-history sh-hidden' });
+
+        this.askResponseRenderEl = this.askAiSectionEl.createDiv({ cls: 'comment-modal-answer-render' });
+
+        this.dfsContainerEl = this.askAiSectionEl.createDiv({ cls: 'comment-modal-dfs-container sh-hidden' });
+
+        const buttonRow = contentEl.createDiv({ cls: 'modal-button-container' });
+        const cancelBtn = buttonRow.createEl('button', { text: 'Cancel', cls: 'comment-modal-btn' });
+        this.addBtnEl = buttonRow.createEl('button', { text: 'Add', cls: 'comment-modal-btn' });
+        this.addBtnEl.addClass('mod-cta');
+
+        const setMode = (mode: 'COMMENT' | 'ASK_AI') => {
+            this.currentMode = mode;
+            if (mode === 'COMMENT') {
+                this.commentSectionEl.removeClass('sh-hidden');
+                this.askAiSectionEl.addClass('sh-hidden');
+                this.commentTabEl.addClass('is-comment-active');
+                this.commentTabEl.removeClass('is-inactive');
+                this.askAiTabEl.addClass('is-inactive');
+                this.askAiTabEl.removeClass('is-ask-active');
+                window.setTimeout(() => this.commentInputEl.focus(), 0);
+            } else {
+                this.askAiSectionEl.removeClass('sh-hidden');
+                this.commentSectionEl.addClass('sh-hidden');
+                this.askAiTabEl.addClass('is-ask-active');
+                this.askAiTabEl.removeClass('is-inactive');
+                this.commentTabEl.addClass('is-inactive');
+                this.commentTabEl.removeClass('is-comment-active');
+                window.setTimeout(() => this.askQueryInputEl.focus(), 0);
+            }
+        };
+
+        const autoResize = (textarea: HTMLTextAreaElement) => {
+            textarea.style.height = 'auto';
+            const maxHeight = 280;
+            const nextHeight = Math.min(textarea.scrollHeight, maxHeight);
+            textarea.style.height = `${nextHeight}px`;
+            textarea.style.overflowY = textarea.scrollHeight > maxHeight ? 'auto' : 'hidden';
+        };
+
+        const bindAutoResize = (textarea: HTMLTextAreaElement) => {
+            autoResize(textarea);
+            textarea.addEventListener('input', () => autoResize(textarea));
+        };
+
+        const setLengthMode = (mode: 'short' | 'medium') => {
+            this.currentLengthMode = mode;
+            if (mode === 'short') {
+                this.shortBtnEl.addClass('is-active');
+                this.mediumBtnEl.removeClass('is-active');
+            } else {
+                this.mediumBtnEl.addClass('is-active');
+                this.shortBtnEl.removeClass('is-active');
+            }
+        };
+
+        const updateAddButtonState = () => {
+            this.addBtnEl.disabled = this.isGenerating;
+            this.generateBtnEl.disabled = this.isGenerating;
+            if (this.isGenerating) {
+                this.addBtnEl.addClass('is-disabled');
+                this.generateBtnEl.addClass('is-disabled');
+                this.addBtnEl.setAttribute('title', '请等待 AI 生成结束');
+            } else {
+                this.addBtnEl.removeClass('is-disabled');
+                this.generateBtnEl.removeClass('is-disabled');
+                this.addBtnEl.removeAttribute('title');
+            }
+        };
+
+        const submitModal = () => {
+            if (this.isGenerating) {
+                return;
+            }
+
+            if (this.currentMode === 'COMMENT') {
+                this.onSubmit(this.commentInputEl.value);
+                this.close();
+                return;
+            }
+
+            const q = this.askQueryInputEl.value.trim();
+            const a = this.finalAnswerMarkdown.trim();
+            this.onSubmit(a || `> **Q**: ${q || '（未填写问题）'} **A**: （无回答）`);
+            this.close();
+        };
+
+        this.commentTabEl.addEventListener('click', () => setMode('COMMENT'));
+        this.askAiTabEl.addEventListener('click', () => setMode('ASK_AI'));
+
+        this.shortBtnEl.addEventListener('click', () => setLengthMode('short'));
+        this.mediumBtnEl.addEventListener('click', () => setLengthMode('medium'));
+
+        const onAskAI = async (): Promise<void> => {
+            const query = this.askQueryInputEl.value.trim();
+            if (!query) {
+                new Notice('Please enter a question first.');
+                return;
+            }
+
+            this.dfsContainerEl.empty();
+            this.dfsContainerEl.addClass('sh-hidden');
+            this.isGenerating = true;
+            this.finalAnswerMarkdown = '';
+            this.askResponseRenderEl.empty();
+            this.startAgentStatusRun();
+            this.pushStatusLog({
+                phase: 'thought',
+                text: 'Starting agent workflow...'
+            });
+            updateAddButtonState();
+
+            try {
+                const result = await this.onGenerate(query, this.currentLengthMode, (status) => {
+                    this.pushStatusLog(status);
+                });
+
+                this.finishAgentStatusRun();
+
+                const finalQA = this.buildFinalQAMarkdown(query, result.finalAnswer || '（无回答）');
+                this.finalAnswerMarkdown = finalQA;
+                void this.renderAnswerMarkdown(finalQA);
+                this.renderDfsRecommendations(result.prerequisites);
+            } catch (error) {
+                console.error('Failed to generate AI response:', error);
+                const detail = error instanceof Error ? error.message : String(error);
+                this.pushStatusLog({
+                    phase: 'observation',
+                    text: `Generation failed: ${detail}`
+                });
+                this.finishAgentStatusRun();
+                this.finalAnswerMarkdown = `Generation failed: ${detail}`;
+                void this.renderAnswerMarkdown(this.finalAnswerMarkdown);
+            } finally {
+                this.isGenerating = false;
+                updateAddButtonState();
+            }
+        };
+
+        this.onAskAIFn = onAskAI;
+        this.generateBtnEl.addEventListener('click', () => {
+            void onAskAI();
+        });
+
+        cancelBtn.addEventListener('click', () => {
+            this.onCancel();
+            this.close();
+        });
+
+        this.addBtnEl.addEventListener('click', submitModal);
+
+        contentEl.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape') {
+                this.onCancel();
+                this.close();
+            }
+            if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+                submitModal();
+            }
+        });
+
+        bindAutoResize(this.commentInputEl);
+        bindAutoResize(this.askQueryInputEl);
+
+        setMode('COMMENT');
+        setLengthMode('short');
+        updateAddButtonState();
+    }
+
+    private startAgentStatusRun(): void {
+        this.statusLogs = [];
+        this.statusHistoryExpanded = false;
+        this.agentStatusContainerEl.removeClass('sh-hidden');
+        this.agentStatusLineEl.addClass('is-running');
+        this.agentStatusHistoryEl.empty();
+        this.agentStatusHistoryEl.addClass('sh-hidden');
+        this.agentStatusLineEl.removeClass('is-clickable');
+
+        this.agentStatusLineEl.onclick = () => {
+            if (this.isGenerating || this.statusLogs.length === 0) {
+                return;
+            }
+            this.statusHistoryExpanded = !this.statusHistoryExpanded;
+            this.agentStatusHistoryEl.toggleClass('sh-hidden', !this.statusHistoryExpanded);
+            this.agentStatusLineEl.toggleClass('is-expanded', this.statusHistoryExpanded);
+            setIcon(this.agentStatusTailEl, this.statusHistoryExpanded ? 'chevron-down' : 'chevron-right');
+        };
+    }
+
+    private finishAgentStatusRun(): void {
+        if (this.statusLogs.length === 0) {
+            return;
+        }
+
+        this.agentStatusLineEl.removeClass('is-running');
+        this.agentStatusLineEl.addClass('is-clickable');
+        this.statusHistoryExpanded = false;
+        this.agentStatusHistoryEl.addClass('sh-hidden');
+        setIcon(this.agentStatusTailEl, 'chevron-right');
+        this.renderStatusHistory();
+    }
+
+    private pushStatusLog(status: AgentStatusUpdate): void {
+        this.statusLogs.push(status);
+        this.renderCompactStatus(status);
+    }
+
+    private renderCompactStatus(status: AgentStatusUpdate): void {
+        setIcon(this.agentStatusIconEl, this.getPhaseIconName(status.phase));
+        this.agentStatusTextEl.setText(`${this.getPhaseLabel(status.phase)}: ${this.summarizeStepText(status.text)}`);
+        if (this.isGenerating) {
+            setIcon(this.agentStatusTailEl, 'loader-2');
+        } else {
+            setIcon(this.agentStatusTailEl, this.statusHistoryExpanded ? 'chevron-down' : 'chevron-right');
+        }
+    }
+
+    private renderStatusHistory(): void {
+        this.agentStatusHistoryEl.empty();
+        for (const log of this.statusLogs) {
+            const row = this.agentStatusHistoryEl.createDiv({ cls: 'agent-status-history-row' });
+            const iconEl = row.createDiv({ cls: 'agent-status-history-icon' });
+            setIcon(iconEl, this.getPhaseIconName(log.phase));
+
+            const textEl = row.createDiv({ cls: 'agent-status-history-text' });
+            textEl.setText(`${this.getPhaseLabel(log.phase)}: ${log.text}`);
+        }
+    }
+
+    private getPhaseIconName(phase: AgentStatusUpdate['phase']): string {
+        if (phase === 'thought') {
+            return 'lightbulb';
+        }
+        if (phase === 'action') {
+            return 'wrench';
+        }
+        return 'binoculars';
+    }
+
+    private getPhaseLabel(phase: AgentStatusUpdate['phase']): string {
+        if (phase === 'thought') {
+            return '思考';
+        }
+        if (phase === 'action') {
+            return '行动';
+        }
+        return '观察';
+    }
+
+    private summarizeStepText(text: string): string {
+        const compact = text.replace(/\s+/g, ' ').trim();
+        return compact.length > 52 ? `${compact.slice(0, 52)}...` : compact;
+    }
+
+    private buildFinalQAMarkdown(question: string, answer: string): string {
+        return `> **Q**: ${question || '（未填写问题）'}  <br> **A**: ${answer || '（无回答）'}`;
+    }
+
+    private async renderAnswerMarkdown(markdown: string): Promise<void> {
+        this.askResponseRenderEl.empty();
+        if (!markdown.trim()) {
+            return;
+        }
+
+        try {
+            await MarkdownRenderer.render(this.app, markdown, this.askResponseRenderEl, '', this.markdownRenderComponent);
+        } catch (error) {
+            console.error('Failed to render markdown answer:', error);
+            this.askResponseRenderEl.setText(markdown);
+        }
+    }
+
+    private renderDfsRecommendations(prerequisites: string[]): void {
+        const items = prerequisites
+            .map(item => item.trim())
+            .filter(item => item.length > 0)
+            .slice(0, 3);
+
+        this.dfsContainerEl.empty();
+        if (items.length === 0) {
+            this.dfsContainerEl.addClass('sh-hidden');
+            return;
+        }
+
+        const title = this.dfsContainerEl.createDiv({ cls: 'comment-modal-dfs-title' });
+        title.setText('相关搜索');
+
+        const list = this.dfsContainerEl.createDiv({ cls: 'comment-modal-dfs-list' });
+        items.forEach((topic) => {
+            const btn = list.createEl('button', {
+                text: topic,
+                cls: 'comment-modal-dfs-btn'
+            });
+
+            btn.addEventListener('click', () => {
+                if (this.isGenerating) {
+                    return;
+                }
+                this.askQueryInputEl.value = topic;
+                this.askQueryInputEl.dispatchEvent(new Event('input'));
+                if (this.onAskAIFn) {
+                    void this.onAskAIFn();
+                }
+            });
+        });
+
+        this.dfsContainerEl.removeClass('sh-hidden');
+    }
+
+    onClose() {
+        this.markdownRenderComponent.unload();
+        this.markdownRenderComponent = new Component();
+        this.onAskAIFn = null;
+        this.statusLogs = [];
+        this.statusHistoryExpanded = false;
+        this.finalAnswerMarkdown = '';
+        const { contentEl } = this;
+        contentEl.empty();
     }
 }
 

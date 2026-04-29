@@ -4,6 +4,7 @@ import { HighlightsSidebarView } from './src/views/sidebar-view';
 import { InlineFootnoteManager } from './src/managers/inline-footnote-manager';
 import { ExcludedFilesModal } from './src/modals/excluded-files-modal';
 import { BackupSelectorModal } from './src/modals/backup-selector-modal';
+import { AIService } from './src/services/AIService';
 import { STANDARD_FOOTNOTE_REGEX, FOOTNOTE_VALIDATION_REGEX } from './src/utils/regex-patterns';
 import { HtmlHighlightParser } from './src/utils/html-highlight-parser';
 import { i18n, t } from './src/i18n';
@@ -142,6 +143,9 @@ export interface CommentPluginSettings {
     taskDateFormat: string; // Date format for parsing dates in tasks (e.g., YYYY-MM-DD)
     showCurrentNoteTasksSection: boolean; // Show current note's tasks section at top of Task tab
     showOnlyCurrentNoteTasks: boolean; // When enabled, only show current note tasks (hide main task list)
+    aiApiKey: string; // API key used by AI explainer
+    aiModel: string; // Chat model name for AI explainer
+    aiBaseUrl: string; // OpenAI-compatible base URL for AI explainer
     displayModes: DisplayMode[]; // Saved display mode configurations
     currentDisplayModeId: string | null; // Currently active display mode ID
 }
@@ -200,6 +204,9 @@ const DEFAULT_SETTINGS: CommentPluginSettings = {
     taskDateFormat: 'YYYY-MM-DD', // Default task date format
     showCurrentNoteTasksSection: true, // Show current note tasks section by default
     showOnlyCurrentNoteTasks: false, // Show all tasks by default
+    aiApiKey: '', // Empty by default; local fallback runs when unset
+    aiModel: 'gpt-4o-mini',
+    aiBaseUrl: 'https://api.openai.com/v1',
     displayModes: [], // Empty array by default
     currentDisplayModeId: null // No active display mode by default
 }
@@ -216,8 +223,10 @@ export default class HighlightCommentsPlugin extends Plugin {
     private ribbonIconEl: HTMLElement | null = null;
     private detectHighlightsTimeout: number | null = null;
     public selectedHighlightId: string | null = null;
+    public selectedCommentFootnoteName: string | null = null;
     public collectionCommands: Set<string> = new Set(); // Track registered collection commands
     private isScanningFiles: boolean = false; // Prevent concurrent scans
+    private aiService: AIService;
 
     async onload() {
         await this.loadSettings();
@@ -236,6 +245,11 @@ export default class HighlightCommentsPlugin extends Plugin {
         this.collections = new Map(Object.entries(this.settings.collections || {}));
         this.collectionsManager = new CollectionsManager(this);
         this.inlineFootnoteManager = new InlineFootnoteManager();
+        this.aiService = new AIService({
+            apiKey: this.settings.aiApiKey,
+            model: this.settings.aiModel,
+            baseUrl: this.settings.aiBaseUrl
+        });
         
         // Register hover source for link previews
         // Note: registerHoverLinkSource may not be available in all Obsidian versions
@@ -441,7 +455,18 @@ export default class HighlightCommentsPlugin extends Plugin {
         this.settings.highlights = Object.fromEntries(this.highlights);
         this.settings.collections = Object.fromEntries(this.collections);
         await this.saveData(this.settings);
+        if (this.aiService) {
+            this.aiService.updateConfig({
+                apiKey: this.settings.aiApiKey,
+                model: this.settings.aiModel,
+                baseUrl: this.settings.aiBaseUrl
+            });
+        }
         this.updateStyles();
+    }
+
+    getAIService(): AIService {
+        return this.aiService;
     }
 
     addStyles() {
@@ -1651,7 +1676,8 @@ export default class HighlightCommentsPlugin extends Plugin {
      */
     async removeHighlightFromSource(
         highlight: Highlight,
-        action: 'remove-highlight' | 'remove-comments' | 'remove-both'
+        action: 'remove-highlight' | 'remove-comments' | 'remove-both',
+        targetFootnoteName?: string
     ): Promise<boolean> {
         const file = this.app.vault.getAbstractFileByPath(highlight.filePath);
         if (!(file instanceof TFile)) {
@@ -1672,6 +1698,24 @@ export default class HighlightCommentsPlugin extends Plugin {
 
         const stripWrapper = action === 'remove-highlight' || action === 'remove-both';
         const stripComments = action === 'remove-comments' || action === 'remove-both';
+
+        if (action === 'remove-comments' && targetFootnoteName) {
+            const precise = this.removeAndReindexSingleStandardFootnote(
+                content,
+                highlight.endOffset,
+                targetFootnoteName
+            );
+
+            if (!precise.removed || precise.content === content) {
+                return false;
+            }
+
+            const cleanedPreciseContent = this.removeEmptyCommentsFromContent(precise.content);
+            await this.applyContentChangeWithTransaction(file, cleanedPreciseContent);
+            await this.loadHighlightsFromFile(file);
+            this.selectedCommentFootnoteName = null;
+            return true;
+        }
 
         let removalEnd = highlight.endOffset;
         let removedFootnoteNames: string[] = [];
@@ -1700,6 +1744,8 @@ export default class HighlightCommentsPlugin extends Plugin {
             newContent = this.removeOrphanedFootnoteDefinitions(newContent, removedFootnoteNames);
         }
 
+        newContent = this.removeEmptyCommentsFromContent(newContent);
+
         // No-op safety check.
         if (newContent === content) {
             return false;
@@ -1712,6 +1758,169 @@ export default class HighlightCommentsPlugin extends Plugin {
         await this.loadHighlightsFromFile(file);
 
         return true;
+    }
+
+    private removeEmptyCommentsFromContent(content: string): string {
+        // Remove empty inline footnotes like ^[   ]
+        let updated = content.replace(/\^\[\s*\]/g, '');
+
+        // Remove standard footnote definitions whose entire body is whitespace.
+        const lines = updated.replace(/\r\n/g, '\n').split('\n');
+        const keptLines: string[] = [];
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            const defMatch = line.match(/^\[\^([a-zA-Z0-9_-]+)\]:\s*(.*)$/);
+
+            if (!defMatch) {
+                keptLines.push(line);
+                continue;
+            }
+
+            const blockLines = [defMatch[2] || ''];
+            let j = i + 1;
+            while (j < lines.length && /^( {2,}|\t+).*$/.test(lines[j])) {
+                blockLines.push(lines[j]);
+                j++;
+            }
+
+            const normalizedBlock = blockLines.join('\n').replace(/[\s\n\t]+/g, '');
+            if (normalizedBlock.length === 0) {
+                // Skip empty definition block entirely.
+                i = j - 1;
+                continue;
+            }
+
+            keptLines.push(line);
+            for (let k = i + 1; k < j; k++) {
+                keptLines.push(lines[k]);
+            }
+            i = j - 1;
+        }
+
+        // Remove references that now point to deleted/empty definitions.
+        const existingDefNames = new Set<string>();
+        for (const line of keptLines) {
+            const m = line.match(/^\[\^([a-zA-Z0-9_-]+)\]:/);
+            if (m) existingDefNames.add(m[1]);
+        }
+
+        updated = keptLines.join('\n').replace(/\[\^([a-zA-Z0-9_-]+)\](?!:)/g, (full, name) => {
+            return existingDefNames.has(name) ? full : '';
+        });
+
+        return updated;
+    }
+
+    private async applyContentChangeWithTransaction(file: TFile, newContent: string): Promise<void> {
+        const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+
+        if (activeView?.file?.path === file.path) {
+            const editorAny = activeView.editor as any;
+            const oldContent = activeView.editor.getValue();
+
+            if (typeof editorAny.transaction === 'function') {
+                editorAny.transaction({
+                    changes: [{ from: 0, to: oldContent.length, text: newContent }]
+                });
+            } else {
+                activeView.editor.setValue(newContent);
+            }
+
+            if (typeof (activeView as any).save === 'function') {
+                await (activeView as any).save();
+            } else {
+                await this.app.vault.modify(file, newContent);
+            }
+            return;
+        }
+
+        await this.app.vault.modify(file, newContent);
+    }
+
+    private removeAndReindexSingleStandardFootnote(
+        content: string,
+        highlightEndOffset: number,
+        targetFootnoteName: string
+    ): { content: string; removed: boolean } {
+        const refs = this.scanTrailingStandardFootnoteRefs(content, highlightEndOffset);
+        const targetRef = refs.find(ref => ref.name === targetFootnoteName);
+
+        if (!targetRef) {
+            return { content, removed: false };
+        }
+
+        let updated = content.substring(0, targetRef.start) + content.substring(targetRef.end);
+
+        const escaped = targetFootnoteName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const defRegex = new RegExp(`^\\[\\^${escaped}\\]:.*(?:\\n[ \\t]+.*)*\\n?`, 'm');
+        updated = updated.replace(defRegex, '');
+
+        const removedNumber = Number.parseInt(targetFootnoteName, 10);
+        if (!Number.isNaN(removedNumber)) {
+            // Re-index definitions first, then references.
+            updated = updated.replace(/\[\^(\d+)\]:(?=\s|$)/g, (full, n) => {
+                const value = Number.parseInt(n, 10);
+                if (value > removedNumber) {
+                    return `[^${value - 1}]:`;
+                }
+                return full;
+            });
+
+            updated = updated.replace(/\[\^(\d+)\](?!:)/g, (full, n) => {
+                const value = Number.parseInt(n, 10);
+                if (value > removedNumber) {
+                    return `[^${value - 1}]`;
+                }
+                return full;
+            });
+        }
+
+        return { content: updated, removed: true };
+    }
+
+    private scanTrailingStandardFootnoteRefs(
+        content: string,
+        startAt: number
+    ): Array<{ name: string; start: number; end: number }> {
+        const refs: Array<{ name: string; start: number; end: number }> = [];
+        let pos = startAt;
+
+        while (pos < content.length) {
+            const wsMatch = content.substring(pos).match(/^\s*/);
+            const wsLen = wsMatch ? wsMatch[0].length : 0;
+            const afterWs = pos + wsLen;
+
+            const standardMatch = content.substring(afterWs).match(/^\[\^([a-zA-Z0-9_-]+)\](?!:)/);
+            if (standardMatch) {
+                refs.push({
+                    name: standardMatch[1],
+                    start: afterWs,
+                    end: afterWs + standardMatch[0].length
+                });
+                pos = afterWs + standardMatch[0].length;
+                continue;
+            }
+
+            if (content.substring(afterWs, afterWs + 2) === '^[') {
+                let depth = 1;
+                let i = afterWs + 2;
+                while (i < content.length && depth > 0) {
+                    if (content[i] === '[') depth++;
+                    else if (content[i] === ']') depth--;
+                    if (depth > 0) i++;
+                }
+                if (depth === 0) {
+                    pos = i + 1;
+                    continue;
+                }
+                break;
+            }
+
+            break;
+        }
+
+        return refs;
     }
 
     /**
@@ -3124,6 +3333,59 @@ class HighlightSettingTab extends PluginSettingTab {
                     this.plugin.settings.minimumCharacterCount = Math.max(0, numValue);
                     await this.plugin.saveSettings();
                     this.plugin.refreshSidebar();
+                }));
+
+        // AI EXPLAINER SECTION
+        new Setting(containerEl).setHeading().setName('AI Explainer');
+
+        new Setting(containerEl)
+            .setName('API Key')
+            .setDesc('OpenAI-compatible API key for generating explanations.')
+            .addText(text => {
+                text
+                    .setPlaceholder('sk-...')
+                    .setValue(this.plugin.settings.aiApiKey || '')
+                    .onChange(async (value) => {
+                        this.plugin.settings.aiApiKey = value.trim();
+                        await this.plugin.saveSettings();
+                    });
+                text.inputEl.type = 'password';
+            });
+
+        new Setting(containerEl)
+            .setName('Model')
+            .setDesc('Model used for explanation generation, for example gpt-4o-mini.')
+            .addText(text => text
+                .setPlaceholder('gpt-4o-mini')
+                .setValue(this.plugin.settings.aiModel || 'gpt-4o-mini')
+                .onChange(async (value) => {
+                    this.plugin.settings.aiModel = value.trim() || 'gpt-4o-mini';
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Base URL')
+            .setDesc('OpenAI-compatible endpoint root, for example https://api.openai.com/v1.')
+            .addText(text => text
+                .setPlaceholder('https://api.openai.com/v1')
+                .setValue(this.plugin.settings.aiBaseUrl || 'https://api.openai.com/v1')
+                .onChange(async (value) => {
+                    this.plugin.settings.aiBaseUrl = value.trim() || 'https://api.openai.com/v1';
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Test AI Connection')
+            .setDesc('Check whether API Key / Model / Base URL can actually call your LLM endpoint.')
+            .addButton(button => button
+                .setButtonText('Run Test')
+                .onClick(async () => {
+                    button.setDisabled(true);
+                    button.setButtonText('Testing...');
+                    const result = await this.plugin.getAIService().checkConnection();
+                    new Notice(result.message, result.ok ? 4000 : 7000);
+                    button.setButtonText('Run Test');
+                    button.setDisabled(false);
                 }));
 
         // VIEWS SECTION

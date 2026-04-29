@@ -15,6 +15,7 @@ export interface HighlightRenderOptions {
     onHighlightClick?: (highlight: Highlight, event?: MouseEvent) => void;
     onAddComment?: (highlight: Highlight) => void;
     onCommentClick?: (highlight: Highlight, commentIndex: number, event?: MouseEvent) => void;
+    onCommentDelete?: (highlight: Highlight, commentIndex: number, event?: MouseEvent) => void;
     onTagClick?: (tag: string) => void;
     onFileNameClick?: (filePath: string, event: MouseEvent) => void;
     onContextMenu?: (highlight: Highlight, event: MouseEvent) => void;
@@ -375,8 +376,22 @@ export class HighlightRenderer {
             if (validFootnoteContents.length > 0) {
                 validFootnoteContents.forEach((content, index) => {
                     const commentDiv = commentsContainer.createDiv({ cls: 'highlight-comment' });
-                    this.renderMarkdownToElement(commentDiv, content);
-                    commentDiv.addEventListener('click', (event) => {
+                    const commentContent = commentDiv.createDiv({ cls: 'highlight-comment-content' });
+                    this.renderMarkdownToElement(commentContent, content);
+
+                    const commentActions = commentDiv.createDiv({ cls: 'highlight-comment-actions' });
+                    const deleteBtn = commentActions.createEl('button', {
+                        cls: 'highlight-comment-delete-btn',
+                        text: 'x',
+                        attr: { title: 'Delete this comment', 'aria-label': 'Delete this comment' }
+                    });
+
+                    deleteBtn.addEventListener('click', (event) => {
+                        event.stopPropagation();
+                        options.onCommentDelete?.(highlight, index, event);
+                    });
+
+                    commentContent.addEventListener('click', (event) => {
                         event.stopPropagation();
                         options.onCommentClick?.(highlight, index, event);
                     });
